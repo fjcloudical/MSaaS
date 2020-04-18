@@ -1,0 +1,460 @@
+---
+# Copyright (c) 2020 Cloudical Polska sp.z.o.o. and/or its affiliates.
+
+- name: Check pre-requisites
+  fail:
+    msg: "Environment variable {{item}} not set. Please declare an environment variable with an appropriate value for the playbook to work."
+  when: item not in ansible_env
+  with_items:
+    - "OCI_COMPARTMENT_OCID"
+    - "OCI_IMAGE_OCID"
+
+# ===========================================================================================
+
+
+- name: create ingress rules yaml body
+  template: src=templates/loadbalancer_public_subnet_ingress_security_rules.yaml.j2 dest=/tmp/loadbalancer_public_subnet_ingress_security_rules.yaml
+- name: create egress yaml body
+  template: src=templates/loadbalancer_public_subnet_egress_security_rules.yaml.j2 dest=/tmp/loadbalancer_public_subnet_egress_security_rules.yaml
+
+#===========================================================================================
+
+# Load the variables defined in the generated files
+
+- name: Load the variables defined in the ingress rules yaml body
+  include_vars:
+    file: /tmp/loadbalancer_public_subnet_ingress_security_rules.yaml
+    name: loaded_ingress
+
+- name: Load the variables defined in the egress rules yaml body
+  include_vars:
+    file: /tmp/loadbalancer_public_subnet_egress_security_rules.yaml
+    name: loaded_egress
+
+#===========================================================================================
+
+- name: Create a VCN
+  oci_vcn:
+    compartment_id: "{{ compartment_id }}"
+    display_name: "{{ vcn_name }}"
+    cidr_block: "{{ cidr_block }}"
+    dns_label: "{{ dns_label }}"
+  register: result
+
+- set_fact:
+    my_vcn_id: "{{ result.vcn.id }}"
+
+#===========================================================================================
+
+- name: Get Three availability domains for subnet
+  oci_ad_facts:
+    compartment_id: "{{compartment_id}}"
+  register: oci_ads
+- set_fact:
+    my_availability_domain_ad1: "{{oci_ads.availability_domains[1].name}}"
+    my_availability_domain_ad2: "{{oci_ads.availability_domains[2].name}}"
+    my_availability_domain_ad3: "{{oci_ads.availability_domains[0].name}}"
+
+- debug: msg="ADs within the Frankfurt region {{my_availability_domain_ad1}} {{my_availability_domain_ad2}}  {{my_availability_domain_ad3}}  "
+
+# ===========================================================================================
+
+- name: Create Internet Gateway
+  oci_internet_gateway:
+            compartment_id: "{{ compartment_id }}"
+            vcn_id: '{{ my_vcn_id }}'
+            name: '{{ ig_name }}'
+            enabled: 'yes'
+            state: 'present'
+  register: result
+- set_fact:
+    ig_id: "{{ result.internet_gateway.id }}"
+
+# ===========================================================================================
+
+- name: Create a Route Table
+  oci_route_table:
+    compartment_id: "{{ compartment_id }}"
+    vcn_id: '{{ my_vcn_id }}'
+    name: '{{ rt_name }}'
+    route_rules:
+        - cidr_block: '{{ all_cidr_block }}'
+          network_entity_id: '{{ ig_id }}'
+    state: 'present'
+  register: result
+
+- set_fact:
+    rt_id: "{{ result.route_table.id }}"
+
+# ===========================================================================================
+
+- name: Create security list
+  oci_security_list:
+    name: '{{ sec_list_name }}'
+    compartment_id: "{{ compartment_id }}"
+    vcn_id: '{{ my_vcn_id }}'
+    state: 'present'
+    ingress_security_rules: '{{ loaded_ingress.loadbalancer_public_subnet_ingress_security_rules }}'
+    egress_security_rules: '{{ loaded_egress.loadbalancer_public_subnet_egress_security_rules }}'
+  register: result
+- set_fact:
+    sec_list_id: "{{ result.security_list.id }}"
+
+# ===========================================================================================
+
+- name: Create a subnet 
+  oci_subnet:
+    name: '{{ subnet_ad}}'
+    dns_label: '{{ subnet_ad}}'
+    route_table_id: '{{ rt_id }}'
+    security_list_ids: ['{{ sec_list_id }}']
+    cidr_block: "{{ subnet_cidr_block_ad1 }}"
+    compartment_id: "{{ compartment_id }}"
+    vcn_id: '{{ my_vcn_id }}'
+  register: result
+
+- set_fact:
+    subnet_id_ad: "{{ result.subnet.id }}"
+
+# ===========================================================================================
+
+- name: Launch First Master Server Instance in Availability Domain 1
+  oci_instance:
+        name: "{{ master_server_instance_one_name }}"
+        image_id: "{{ master_server_image_id }}"
+        shape: "{{ master_server_shape }}"
+        compartment_id: "{{ compartment_id }}"
+        availability_domain: "{{ my_availability_domain_ad1 }}"
+        metadata:
+            user_data: "{{ lookup('file', '{{ playbook_dir}}/files/loadbalancer_instance_bootstrap')| b64encode}}"
+        vnic:
+            hostname_label: "{{ master_server_instance_one_name }}"
+            subnet_id: "{{ subnet_id_ad }}"
+  register: result
+
+- set_fact:
+    master_server_instance_one_id: "{{ result.instance.id }}"
+
+# ===========================================================================================
+
+- name: Get VNIC attachments of Master Server Instance 1
+  oci_vnic_attachment_facts:
+    compartment_id: '{{ compartment_id }}'
+    instance_id: '{{ master_server_instance_one_id }}'
+  register: vnic_attachment_details
+
+- name: Get Private IP address of  Master Server Instance 1
+  oci_vnic_facts:
+    id: '{{ vnic_attachment_details.vnic_attachments[0].vnic_id }}'
+  register: vnic_details
+
+- debug:
+    msg: "{{ vnic_details }}"
+
+- set_fact:
+    master_server_instance_one_private_ip: "{{ vnic_details.vnic.private_ip }}"
+
+# ===========================================================================================
+
+- name: Launch Second Master Server Instance in Availability Domain 2
+  oci_instance:
+        name: "{{ master_server_instance_two_name }}"
+        image_id: "{{ master_server_image_id }}"
+        shape: "{{ master_server_shape }}"
+        compartment_id: "{{ compartment_id }}"
+        availability_domain: "{{ my_availability_domain_ad2 }}"
+        metadata:
+            user_data: "{{ lookup('file', '{{ playbook_dir}}/files/loadbalancer_instance_bootstrap')| b64encode}}"
+        vnic:
+            hostname_label: "{{ master_server_instance_two_name }}"
+            subnet_id: "{{ subnet_id_ad }}"
+  register: result
+
+- set_fact:
+    master_server_instance_two_id: "{{ result.instance.id }}"
+
+# ===========================================================================================
+
+- name: Get VNIC attachments of Master Server Instance 2
+  oci_vnic_attachment_facts:
+    compartment_id: '{{ compartment_id }}'
+    instance_id: '{{ master_server_instance_two_id }}'
+  register: vnic_attachment_details
+
+- name: Get Private IP address of Master Server Instance 2
+  oci_vnic_facts:
+    id: '{{ vnic_attachment_details.vnic_attachments[0].vnic_id }}'
+  register: vnic_details
+
+- debug:
+    msg: "{{ vnic_details }}"
+
+- set_fact:
+    master_server_instance_two_private_ip: "{{ vnic_details.vnic.private_ip }}"
+
+# ===========================================================================================
+
+
+- name: Launch Third Master Server Instance in Availability Domain 3
+  oci_instance:
+        name: "{{ master_server_instance_three_name }}"
+        image_id: "{{ master_server_image_id }}"
+        shape: "{{ master_server_shape }}"
+        compartment_id: "{{ compartment_id }}"
+        availability_domain: "{{ my_availability_domain_ad3 }}"
+        metadata:
+            user_data: "{{ lookup('file', '{{ playbook_dir}}/files/loadbalancer_instance_bootstrap')| b64encode}}"
+        vnic:
+            hostname_label: "{{ master_server_instance_three_name }}"
+            subnet_id: "{{ subnet_id_ad }}"
+  register: result
+
+- set_fact:
+    master_server_instance_three_id: "{{ result.instance.id }}"
+
+# ===========================================================================================
+
+
+
+- name: Launch First Worker Server Instance in Availability Domain 1
+  oci_instance:
+        name: "{{ worker_server_instance_one_name }}"
+        image_id: "{{ worker_server_image_id }}"
+        shape: "{{ worker_server_shape }}"
+        compartment_id: "{{ compartment_id }}"
+        availability_domain: "{{ my_availability_domain_ad3 }}"
+        metadata:
+            user_data: "{{ lookup('file', '{{ playbook_dir}}/files/loadbalancer_instance_bootstrap')| b64encode}}"
+        vnic:
+            hostname_label: "{{ worker_server_instance_one_name }}"
+            subnet_id: "{{ subnet_id_ad }}"
+  register: result
+
+- set_fact:
+    worker_server_instance_one_id: "{{ result.instance.id }}"
+
+# =========================================================================================== 
+
+
+- name: Get VNIC attachments of Master Server Instance 3
+  oci_vnic_attachment_facts:
+    compartment_id: '{{ compartment_id }}'
+    instance_id: '{{ master_server_instance_three_id }}'
+  register: vnic_attachment_details
+
+- name: Get Private IP address of Master Server Instance 3
+  oci_vnic_facts:
+    id: '{{ vnic_attachment_details.vnic_attachments[0].vnic_id }}'
+  register: vnic_details
+
+- debug:
+    msg: "{{ vnic_details }}"
+
+- set_fact:
+    master_server_instance_three_private_ip: "{{ vnic_details.vnic.private_ip }}"
+
+
+
+# ===========================================================================================  
+
+
+- name: Get VNIC attachments of Worker Server Instance 1
+  oci_vnic_attachment_facts:
+    compartment_id: '{{ compartment_id }}'
+    instance_id: '{{ worker_server_instance_one_id }}'
+  register: vnic_attachment_details
+
+- name: Get Private IP address of Worker Server Instance 1
+  oci_vnic_facts:
+    id: '{{ vnic_attachment_details.vnic_attachments[0].vnic_id }}'
+  register: vnic_details
+
+- debug:
+    msg: "{{ vnic_details }}"
+
+- set_fact:
+    worker_server_instance_one_private_ip: "{{ vnic_details.vnic.private_ip }}"
+
+
+
+# ===========================================================================================
+ 
+
+- name: Launch Second Worker Server Instance in Availability Domain 2
+  oci_instance:
+        name: "{{ worker_server_instance_two_name }}"
+        image_id: "{{ worker_server_image_id }}"
+        shape: "{{ worker_server_shape }}"
+        compartment_id: "{{ compartment_id }}"
+        availability_domain: "{{ my_availability_domain_ad2 }}"
+        metadata:
+            user_data: "{{ lookup('file', '{{ playbook_dir}}/files/loadbalancer_instance_bootstrap')| b64encode}}"
+        vnic:
+            hostname_label: "{{ worker_server_instance_two_name }}"
+            subnet_id: "{{ subnet_id_ad }}"
+  register: result
+
+- set_fact:
+    worker_server_instance_two_id: "{{ result.instance.id }}"
+
+# ===========================================================================================
+
+
+- name: Get VNIC attachments of Worker Server Instance 2
+  oci_vnic_attachment_facts:
+    compartment_id: '{{ compartment_id }}'
+    instance_id: '{{ worker_server_instance_two_id }}'
+  register: vnic_attachment_details
+
+- name: Get Private IP address of Worker Server Instance 2
+  oci_vnic_facts:
+    id: '{{ vnic_attachment_details.vnic_attachments[0].vnic_id }}'
+  register: vnic_details
+
+- debug:
+    msg: "{{ vnic_details }}"
+
+- set_fact:
+    worker_server_instance_two_private_ip: "{{ vnic_details.vnic.private_ip }}"
+
+# ===========================================================================================
+
+- name: Launch Third Worker Server Instance in Availability Domain 3
+  oci_instance:
+        name: "{{ worker_server_instance_three_name }}"
+        image_id: "{{ worker_server_image_id }}"
+        shape: "{{ worker_server_shape }}"
+        compartment_id: "{{ compartment_id }}"
+        availability_domain: "{{ my_availability_domain_ad3 }}"
+        metadata:
+            user_data: "{{ lookup('file', '{{ playbook_dir}}/files/loadbalancer_instance_bootstrap')| b64encode}}"
+        vnic:
+            hostname_label: "{{ worker_server_instance_three_name }}"
+            subnet_id: "{{ subnet_id_ad }}"
+  register: result
+
+- set_fact:
+    worker_server_instance_three_id: "{{ result.instance.id }}"
+
+# ===========================================================================================
+
+- name: Get VNIC attachments of Worker Server Instance 3
+  oci_vnic_attachment_facts:
+    compartment_id: '{{ compartment_id }}'
+    instance_id: '{{ worker_server_instance_three_id }}'
+  register: vnic_attachment_details
+
+- name: Get Private IP address of Worker Server Instance 3
+  oci_vnic_facts:
+    id: '{{ vnic_attachment_details.vnic_attachments[0].vnic_id }}'
+  register: vnic_details
+
+- debug:
+    msg: "{{ vnic_details }}"
+
+- set_fact:
+    worker_server_instance_three_private_ip: "{{ vnic_details.vnic.private_ip }}"
+
+#==========================================================================================
+
+
+- name: Launch Management Server Instance in Availability Domain 3
+  oci_instance:
+        name: "{{ management_server_instance_name }}"
+        image_id: "{{ management_server_image_id }}"
+        shape: "{{ management_server_shape }}"
+        compartment_id: "{{ compartment_id }}"
+        availability_domain: "{{ my_availability_domain_ad3 }}"
+        metadata:
+            user_data: "{{ lookup('file', '{{ playbook_dir}}/files/management_instance_bootstrap')| b64encode}}"
+        vnic:
+            hostname_label: "{{ management_server_instance_name }}"
+            subnet_id: "{{ subnet_id_ad }}"
+  register: result
+
+- set_fact:
+    management_server_instance_id: "{{ result.instance.id }}"
+
+#==========================================================================================
+
+- name: Get VNIC attachments of Management Server Instance
+  oci_vnic_attachment_facts:
+    compartment_id: '{{ compartment_id }}'
+    instance_id: '{{ management_server_instance_three_id }}'
+  register: vnic_attachment_details
+
+- name: Get Private IP address of Management Server Instance 
+  oci_vnic_facts:
+    id: '{{ vnic_attachment_details.vnic_attachments[0].vnic_id }}'
+  register: vnic_details
+
+- debug:
+    msg: "{{ vnic_details }}"
+
+- set_fact:
+    management_server_instance_private_ip: "{{ vnic_details.vnic.private_ip }}"
+
+
+
+# ===========================================================================================
+
+# A self-singed temporary certificate is used here, so that the it can be run without any dependencies,
+# and the certificate can be validated. In production environment, a valid certificate should be used.
+
+- name: create temporary directory for certificates
+  tempfile:
+    state: directory
+    suffix: cert
+  register: result
+
+- set_fact:
+    cert_path: "{{ result.path }}"
+
+# ===========================================================================================
+
+- name: Generate CA Cert Key
+  openssl_privatekey:
+    path: "{{cert_path}}/ca_key.pem"
+    type: RSA
+    size: 4096
+
+# ===========================================================================================
+
+- name: Generate CA cert
+  command: openssl req \
+        -x509 -new -days 365 \
+        -subj '/C=PL/ST=DL/L=Wroclaw/O=Cloud/CN=www.cloudical.io'
+        -key "{{cert_path}}/ca_key.pem" \
+        -out "{{cert_path}}/ca_cert.pem"
+  args:
+      creates: "{{cert_path}}/ca_cert.pem"
+
+# ===========================================================================================
+
+- name: Generate Server Private Key Without Passphrase
+  openssl_privatekey:
+      path: "{{cert_path}}/private_key.pem"
+      type: RSA
+      size: 4096
+
+# ===========================================================================================
+
+- name: Generate Certificate Signing Request With Normal Private Key
+  openssl_csr:
+    path: "{{cert_path}}/csr.pem"
+    privatekey_path: "{{cert_path}}/private_key.pem"
+    country_name: PL
+    organization_name: Cloudical
+    state_or_province_name: DL
+    locality_name: Wroclaw
+    common_name: www.cloudical.io
+
+# ===========================================================================================
+
+- name: Generate CA signed Certificate Without Passphrase
+  command: openssl x509 -req \
+        -days 1825 -CA "{{cert_path}}/ca_cert.pem" -CAkey "{{cert_path}}/ca_key.pem" -CAcreateserial \
+        -in "{{cert_path}}/csr.pem" \
+        -out "{{cert_path}}/cert.pem"
+  args:
+    creates: "{{cert_path}}/cert.pem"

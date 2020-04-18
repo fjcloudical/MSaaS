@@ -1,0 +1,241 @@
+---
+# Copyright (c) 2020 Cloudical Polska sp.z.o.o. and/or its affiliates.
+
+- name: Create a public load balancer instance and print the details
+  hosts: localhost
+  connection: local
+  vars:
+    vcn_name: "vcn"
+    cidr_block: "10.1.0.0/16"
+    dns_label: "vcn"
+    ig_name: "ig"
+    rt_name: "rt"
+    sec_list_name: "sec_list"
+
+    subnet_ad: 'subnetad1'
+    subnet_cidr_block_ad1: "10.1.20.0/24"
+    all_cidr_block: '0.0.0.0/0'
+    all_protocol: 'all'
+    tcp_protocol: '6'
+
+    master_server_instance_one_name: 'master001'
+    master_server_instance_two_name: 'master002'
+    master_server_instance_three_name: 'master003'
+    worker_server_instance_one_name: 'worker001'
+    worker_server_instance_two_name: 'worker002'
+    worker_server_instance_three_name: 'worker003'
+    management_server_instance_name: 'management01'
+    master_server_shape: "{{ lookup('env', 'OCI_INSTANCE_SHAPE') | default('VM.Standard2.1', true) }}"
+
+#   Here we have some error related to Shape VM.Standard.E2.1 is not compatible with my image. Quite strange, need to check it.
+
+    worker_server_shape: "{{ lookup('env', 'OCI_INSTANCE_SHAPE') | default('VM.Standard2.1', true) }}"
+    management_server_shape: "{{ lookup('env', 'OCI_INSTANCE_SHAPE') | default('VM.Standard2.1', true) }}"
+
+
+    lb_name: "load_balancer"
+    lb_shape: "100Mbps"
+    lb_backend_set_name: 'backend_set'
+    lb_backend_set_policy: 'ROUND_ROBIN'
+
+    # Initialize values for certificates
+    lb_ca_certificate: "{{cert_path}}/ca_cert.pem"
+    private_key: "{{cert_path}}/private_key.pem"
+    public_certificate: "{{cert_path}}/cert.pem"
+    certificate_name: "lb_certs"
+
+    # Initialize values for listeners
+    http_listener_name: 'http_listener'
+    https_listener_name: 'https_listener'
+    apiserver_listener_name: 'apiserver_listener'
+    dex_listener_name: 'dex_listener'
+    gangway_listener_name: 'gangway_listener'
+
+    http_port: 80
+    https_port: 443
+    apiserver_port: 6443
+    dex_port:  32000
+    gangway_port: 32001
+
+    #########################################
+    # Tenancy specific configuration
+    # *Note* - Override the following variables based on your tenancy
+    # or set a valid value for the corresponding environment variable
+    #########################################
+    compartment_id: "{{ lookup('env', 'OCI_COMPARTMENT_OCID') }}"
+    master_server_image_id: "{{ lookup('env', 'OCI_IMAGE_OCID') }}"
+    worker_server_image_id: "{{ lookup('env', 'OCI_IMAGE_OCID') }}"
+    management_server_image_id: "{{ lookup('env', 'OCI_IMAGE_OCID') }}"
+
+
+# Create a public load balancer with the variables initialized in the beginning
+  tasks:
+    - include_tasks: setup_loadbalancer_with_servers.yaml
+    - name: Create Public Load Balancer
+      oci_load_balancer:
+        compartment_id: "{{ compartment_id }}"
+        name: "{{ lb_name }}"
+        shape_name: "{{ lb_shape }}"
+        subnet_ids:
+          - "{{ subnet_id_ad }}"
+        state: 'present'
+      register: result
+    - debug:
+       msg: "Load balancer details: {{ result.load_balancer}}"
+    - set_fact:
+        public_load_balancer_id: "{{ result.load_balancer.id }}"
+        public_load_balancer_ip_addresses: "{{ result.load_balancer.ip_addresses }}"
+#==========================================================================================
+    - name: Create Backend Set
+      oci_load_balancer_backend_set:
+         load_balancer_id: "{{ public_load_balancer_id }}"
+         name: '{{ lb_backend_set_name }}'
+         policy: '{{ lb_backend_set_policy }}'
+         health_checker:
+            interval_in_millis: 30000
+            port: '{{ http_port }}'
+            protocol: "HTTP"
+            response_body_regex: ".*"
+            retries: 3
+            timeout_in_millis: 10000
+            return_code: 200
+            url_path: "/"
+         state: 'present'
+#==========================================================================================
+    - name: Create Certificate for Listener
+      oci_load_balancer_certificate:
+         load_balancer_id: "{{ public_load_balancer_id }}"
+         name: '{{ certificate_name }}'
+         ca_certificate: '{{ lb_ca_certificate }}'
+         private_key: '{{ private_key }}'
+         public_certificate: '{{ public_certificate }}'
+         state: 'present'
+ #==========================================================================================
+    - name: Create Listener for HTTP traffic
+      oci_load_balancer_listener:
+         load_balancer_id: "{{ public_load_balancer_id }}"
+         name: '{{ http_listener_name }}'
+         default_backend_set_name: '{{ lb_backend_set_name }}'
+         port: '{{ http_port }}'
+         protocol: "HTTP"
+         connection_configuration:
+              idle_timeout: 300
+         state: 'present'
+#==========================================================================================
+    - name: Create Listener for HTTPS traffic
+      oci_load_balancer_listener:
+         load_balancer_id: "{{ public_load_balancer_id }}"
+         name: '{{ https_listener_name }}'
+         default_backend_set_name: '{{ lb_backend_set_name }}'
+         port: '{{ https_port }}'
+         protocol: "HTTP"
+         ssl_configuration:
+            certificate_name: '{{ certificate_name }}'
+            verify_peer_certificate: False
+         state: 'present'
+
+#==========================================================================================
+
+
+    - name: Create Listener for APIServer traffic
+      oci_load_balancer_listener:
+         load_balancer_id: "{{ public_load_balancer_id }}"
+         name: '{{ apiserver_listener_name }}'
+         default_backend_set_name: '{{ lb_backend_set_name }}'
+         port: '{{ apiserver_port }}'
+         protocol: "HTTP"
+         ssl_configuration:
+            certificate_name: '{{ certificate_name }}'
+            verify_peer_certificate: False
+         state: 'present'
+
+#==========================================================================================
+
+    - name: Create Listener for DEX traffic
+      oci_load_balancer_listener:
+         load_balancer_id: "{{ public_load_balancer_id }}"
+         name: '{{ dex_listener_name }}'
+         default_backend_set_name: '{{ lb_backend_set_name }}'
+         port: '{{ dex_port }}'
+         protocol: "HTTP"
+         ssl_configuration:
+            certificate_name: '{{ certificate_name }}'
+            verify_peer_certificate: False
+         state: 'present'
+
+#==========================================================================================
+
+    - name: Create Listener for Gangway traffic
+      oci_load_balancer_listener:
+         load_balancer_id: "{{ public_load_balancer_id }}"
+         name: '{{ gangway_listener_name }}'
+         default_backend_set_name: '{{ lb_backend_set_name }}'
+         port: '{{ gangway_port }}'
+         protocol: "HTTP"
+         ssl_configuration:
+            certificate_name: '{{ certificate_name }}'
+            verify_peer_certificate: False
+         state: 'present'
+
+
+#==========================================================================================
+    - name: Create First Backend
+      oci_load_balancer_backend:
+           load_balancer_id: "{{ public_load_balancer_id }}"
+           backend_set_name: "{{ lb_backend_set_name }}"
+           ip_address: "{{ master_server_instance_one_private_ip }}"
+           port: '{{ http_port }}'
+           backup: False
+           drain: False
+           offline: False
+           weight: 1
+           state: 'present'
+
+#==========================================================================================
+
+    - name: Create Second Backend
+      oci_load_balancer_backend:
+           load_balancer_id: "{{ public_load_balancer_id }}"
+           backend_set_name: "{{ lb_backend_set_name }}"
+           ip_address: "{{ master_server_instance_two_private_ip }}"
+           port: '{{ http_port }}'
+           backup: False
+           drain: False
+           offline: False
+           weight: 1
+           state: 'present'
+
+#==========================================================================================
+
+    - name: Create Third Backend
+      oci_load_balancer_backend:
+           load_balancer_id: "{{ public_load_balancer_id }}"
+           backend_set_name: "{{ lb_backend_set_name }}"
+           ip_address: "{{ master_server_instance_three_private_ip }}"
+           port: '{{ http_port }}'
+           backup: False
+           drain: False
+           offline: False
+           weight: 1
+           state: 'present'
+
+#==========================================================================================
+#    - name: Check whether the Load Balancer able to access Backends
+#      uri:
+#         url: 'http://{{public_load_balancer_ip_addresses[0].ip_address}}/'
+#         body_format: json
+#         timeout: 300
+#      register: result
+#      retries: 5
+#      delay: 60
+#      until: result['status']|default(0) == 200
+#    - debug:
+#        msg: "{{ result.status }} "
+#    - assert:
+#        that:  "200 == {{ result.status }}"
+#==========================================================================================
+    - debug:
+        msg: "Load balancer IP addresses details : {{ public_load_balancer_ip_addresses }}"
+
+#==========================================================================================
+    - include_tasks: teardown_loadbalancer_with_servers.yaml
