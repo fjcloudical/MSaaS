@@ -9,6 +9,7 @@ OCI_COMPARTMENT_OCID
 
 OCI_IMAGE_OCID
 
+Run the following: 
 
 
 ansible-playbook loadbalancer_with_servers.yaml    
